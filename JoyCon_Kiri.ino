@@ -1,29 +1,88 @@
+/*
+  ============================================================
+   JOY-CON KIRI (LEFT) - ESP32-C3 Supermini
+   Fitur: BLE Gamepad + ESP-NOW Transmitter/Receiver + HC-SR04 Kiri + Macro Mode
+  ============================================================
+*/
+
 #include <BleGamepad.h>
+#include <esp_now.h>
+#include <WiFi.h>
 
-// ---------- KONFIGURASI PIN ----------
-const int PIN_VRX   = 0;   // GPIO0
-const int PIN_VRY   = 1;   // GPIO1
-const int PIN_SW    = 2;   // GPIO2 (klik stick)
+// ---------- KONFIGURASI PIN GAMEPAD ----------
+const int PIN_VRX    = 0;   // GPIO0
+const int PIN_VRY    = 1;   // GPIO1
+const int PIN_SW     = 2;   // GPIO2 (klik stick)
 
-const int PIN_BTN_A     = 4;   // GPIO4 -> Tombol A
-const int PIN_BTN_Y     = 5;   // GPIO5 -> Tombol Y
-const int PIN_BTN_UP    = 6;   // GPIO6 -> D-Pad Atas
-const int PIN_BTN_DOWN  = 7;   // GPIO7 -> D-Pad Bawah
-const int PIN_BTN_LB    = 8;   // GPIO8 -> LB (L1)
-const int PIN_BTN_LT    = 9;   // GPIO9 -> LT (L2)
+const int PIN_BTN_ACTIVATE = 3;  // GPIO3 -> Tombol Aktivasi Driver
+
+const int PIN_BTN_A    = 4;   // GPIO4 -> Tombol A
+const int PIN_BTN_Y    = 5;   // GPIO5 -> Tombol Y
+const int PIN_BTN_UP   = 6;   // GPIO6 -> D-Pad Atas
+const int PIN_BTN_DOWN = 7;   // GPIO7 -> D-Pad Bawah
+const int PIN_BTN_LB   = 8;   // GPIO8 -> LB (L1)
+const int PIN_BTN_LT   = 9;   // GPIO9 -> LT (L2)
+
+// ---------- PIN SENSOR ULTRASONIK (HC-SR04 KIRI) ----------
+const int PIN_TRIG = 10;  // GPIO10
+const int PIN_ECHO = 20;  // GPIO20
+const int TRIGGER_DISTANCE_CM = 15; // Batas jarak tangan (15cm)
+
+// ---------- ALAMAT MAC ESP32 KANAN ----------
+uint8_t broadcastAddress[] = {0xE8, 0x3D, 0xC1, 0x9D, 0x7B, 0x48}; // MAC Joy-Con Kanan
+
+// ---------- STRUKTUR DATA ESP-NOW ----------
+struct SystemState {
+  int currentState; // 0: Reset, 1: Standby (0001), 2: Left Trigger (0002), 3: Right Trigger (0003), 4: Complete (0004)
+};
+SystemState stateData;
 
 // ---------- KONFIGURASI FILTER ANALOG ----------
-const int   OVERSAMPLE_COUNT   = 8;      // jumlah sample per pembacaan
-const float EMA_ALPHA          = 0.15f;  // makin kecil = makin halus, tapi makin lag
-const int   DEADZONE_RADIUS    = 6;      // rentang deadzone (-127..127)
-const int   ADC_MAX            = 4095;   // ESP32-C3 ADC 12-bit
+const int   OVERSAMPLE_COUNT   = 8;
+const float EMA_ALPHA          = 0.15f;
+const int   DEADZONE_RADIUS    = 6;
+const int   ADC_MAX            = 4095;
 
-// ---------- STATE ----------
+// ---------- STATE SYSTEM ----------
 float emaX = 0, emaY = 0;
 int centerX = 2048, centerY = 2048;   
-bool firstRead = true;
+bool isDriverActivated = false;
+bool leftSensorTriggered = false;
+bool isMacroActive = false; // Flag Mode Makro aktif setelah Complete
 
 BleGamepad bleGamepad("JoyCon Kiri v2", "DIY", 100);
+
+// Callback Pengiriman Data (Kompatibel ESP32 v3.x)
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // Callback pengiriman
+}
+
+// Callback Penerimaan Data (Menerima sinyal State 4 Complete dari Joy-Con Kanan)
+void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
+  SystemState recvState;
+  memcpy(&recvState, incomingData, sizeof(recvState));
+  
+  if (recvState.currentState == 4) {
+    isMacroActive = true;
+    Serial.println("[KIRI] Sinyal Complete (State 4) Diterima -> Mode Makro AKTIF!");
+  } else if (recvState.currentState == 0) {
+    isMacroActive = false;
+    Serial.println("[KIRI] Reset State Diterima -> Normal Mode");
+  }
+}
+
+// ---------- FUNGSI ULTRASONIK & ANALOG ----------
+long measureDistance() {
+  digitalWrite(PIN_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG, LOW);
+
+  long duration = pulseIn(PIN_ECHO, HIGH, 20000); 
+  if (duration == 0) return -1;
+  return (duration * 0.0343 / 2);
+}
 
 int readAveraged(int pin) {
   long sum = 0;
@@ -36,85 +95,150 @@ int readAveraged(int pin) {
 
 void calibrateCenter() {
   long sumX = 0, sumY = 0;
-  const int samples = 50;
-  for (int i = 0; i < samples; i++) {
+  for (int i = 0; i < 50; i++) {
     sumX += readAveraged(PIN_VRX);
     sumY += readAveraged(PIN_VRY);
     delay(5);
   }
-  centerX = sumX / samples;
-  centerY = sumY / samples;
+  centerX = sumX / 50;
+  centerY = sumY / 50;
 }
 
 int8_t processAxis(int raw, int center, float &emaState) {
   emaState = (EMA_ALPHA * raw) + ((1.0f - EMA_ALPHA) * emaState);
-
   float diff = emaState - center;
-  float scaled;
-  if (diff >= 0) {
-    scaled = (diff / (ADC_MAX - center)) * 127.0f;
-  } else {
-    scaled = (diff / center) * 127.0f;
-  }
-
-  int val = (int)scaled;
-  val = constrain(val, -127, 127);
-
+  float scaled = (diff >= 0) ? (diff / (ADC_MAX - center)) * 127.0f : (diff / center) * 127.0f;
+  int val = constrain((int)scaled, -127, 127);
   if (abs(val) < DEADZONE_RADIUS) val = 0;
-
   return (int8_t)val;
 }
 
+void sendStateToRight(int state) {
+  stateData.currentState = state;
+  esp_now_send(broadcastAddress, (uint8_t *) &stateData, sizeof(stateData));
+}
+
+// ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PIN_SW,       INPUT_PULLUP);
-  pinMode(PIN_BTN_A,    INPUT_PULLUP);
-  pinMode(PIN_BTN_Y,    INPUT_PULLUP);
-  pinMode(PIN_BTN_UP,   INPUT_PULLUP);
-  pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
-  pinMode(PIN_BTN_LB,   INPUT_PULLUP);
-  pinMode(PIN_BTN_LT,   INPUT_PULLUP);
+  pinMode(PIN_SW,           INPUT_PULLUP);
+  pinMode(PIN_BTN_ACTIVATE, INPUT_PULLUP);
+  pinMode(PIN_BTN_A,        INPUT_PULLUP);
+  pinMode(PIN_BTN_Y,        INPUT_PULLUP);
+  pinMode(PIN_BTN_UP,       INPUT_PULLUP);
+  pinMode(PIN_BTN_DOWN,     INPUT_PULLUP);
+  pinMode(PIN_BTN_LB,       INPUT_PULLUP);
+  pinMode(PIN_BTN_LT,       INPUT_PULLUP);
+
+  pinMode(PIN_TRIG, OUTPUT);
+  pinMode(PIN_ECHO, INPUT);
+  digitalWrite(PIN_TRIG, LOW);
+
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+    
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, broadcastAddress, 6);
+    peerInfo.channel = 0;  
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+  }
 
   analogReadResolution(12);
-
-  Serial.println("Kalibrasi stick... jangan sentuh joystick!");
   delay(800);
   calibrateCenter();
   emaX = centerX;
   emaY = centerY;
-  Serial.printf("Kalibrasi selesai. CenterX=%d CenterY=%d\n", centerX, centerY);
 
   BleGamepadConfiguration cfg;
   cfg.setAutoReport(false);
   cfg.setControllerType(CONTROLLER_TYPE_GAMEPAD);
-  cfg.setButtonCount(7);
+  cfg.setButtonCount(8);
   cfg.setHatSwitchCount(0);
   cfg.setWhichAxes(true, true, false, false, false, false, false, false); 
   bleGamepad.begin(&cfg);
 }
 
+// ---------- LOOP ----------
 void loop() {
   if (bleGamepad.isConnected()) {
+    // 1. Baca Joystick Analog
     int rawX = readAveraged(PIN_VRX);
     int rawY = readAveraged(PIN_VRY);
+    bleGamepad.setAxes(processAxis(rawX, centerX, emaX), processAxis(rawY, centerY, emaY), 0, 0, 0, 0, 0, 0);
 
-    int8_t gx = processAxis(rawX, centerX, emaX);
-    int8_t gy = processAxis(rawY, centerY, emaY);
+    // 2. Baca Tombol Joy-Con (Mode Normal vs Mode Makro)
+    if (!isMacroActive) {
+      // --- MODE NORMAL (Gamepad Standar) ---
+      if (digitalRead(PIN_SW)       == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1);
+      if (digitalRead(PIN_BTN_A)    == LOW) bleGamepad.press(BUTTON_2); else bleGamepad.release(BUTTON_2);
+      if (digitalRead(PIN_BTN_Y)    == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3);
+      if (digitalRead(PIN_BTN_UP)   == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4);
+      if (digitalRead(PIN_BTN_DOWN) == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5);
+      if (digitalRead(PIN_BTN_LB)   == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
+      if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
+    } else {
+      // --- MODE MAKRO (Setelah Henshin Complete) ---
+      // Contoh: Tombol A menekan Button 2 + Button 6 sekaligus
+      if (digitalRead(PIN_BTN_A) == LOW) {
+        bleGamepad.press(BUTTON_2);
+        bleGamepad.press(BUTTON_6);
+      } else {
+        bleGamepad.release(BUTTON_2);
+        bleGamepad.release(BUTTON_6);
+      }
+      
+      if (digitalRead(PIN_SW)       == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1);
+      if (digitalRead(PIN_BTN_Y)    == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3);
+      if (digitalRead(PIN_BTN_UP)   == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4);
+      if (digitalRead(PIN_BTN_DOWN) == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5);
+      if (digitalRead(PIN_BTN_LB)   == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
+      if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
+    }
 
-    bleGamepad.setAxes(gx, gy, 0, 0, 0, 0, 0, 0);
+    // 3. LOGIKA AKTIVASI & ULTRASONIK KIRI
+    bool btnActivateState = (digitalRead(PIN_BTN_ACTIVATE) == LOW);
+    if (btnActivateState) {
+      bleGamepad.press(BUTTON_8);
+      
+      if (!isDriverActivated) {
+        isDriverActivated = true;
+        leftSensorTriggered = false;
+        sendStateToRight(1); // Perintah Kanan: Putar 0001.mp3
+        Serial.println("[STATE 1] Driver Active -> Sinyal 0001.mp3 terkirim ke Kanan");
+      }
 
-    // Tombol Joy-Con Kiri (aktif LOW)
-    if (digitalRead(PIN_SW)       == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1); // Click Stick (L3)
-    if (digitalRead(PIN_BTN_A)    == LOW) bleGamepad.press(BUTTON_2); else bleGamepad.release(BUTTON_2); // Tombol A
-    if (digitalRead(PIN_BTN_Y)    == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3); // Tombol Y
-    if (digitalRead(PIN_BTN_UP)   == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4); // D-Pad Atas
-    if (digitalRead(PIN_BTN_DOWN) == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5); // D-Pad Bawah
-    if (digitalRead(PIN_BTN_LB)   == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6); // LB (L1)
-    if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7); // LT (L2)
+      if (isDriverActivated && !leftSensorTriggered) {
+        static unsigned long lastUltrasoundTime = 0;
+        if (millis() - lastUltrasoundTime > 60) {
+          lastUltrasoundTime = millis();
+          long dist = measureDistance();
+          
+          if (dist > 0 && dist <= TRIGGER_DISTANCE_CM) {
+            leftSensorTriggered = true;
+            sendStateToRight(2); // Perintah Kanan: Putar 0002.mp3
+            Serial.printf("[STATE 2] HC-SR04 Kiri Trigger (%ld cm) -> Sinyal 0002.mp3 terkirim ke Kanan\n", dist);
+          }
+        }
+      }
+
+    } else {
+      bleGamepad.release(BUTTON_8);
+      
+      // Jika tombol aktivasi dilepas SEBELEUM Henshin Selesai (bukan dalam Mode Makro)
+      if (isDriverActivated && !isMacroActive) {
+        isDriverActivated = false;
+        leftSensorTriggered = false;
+        sendStateToRight(0); // Sinyal Reset ke Kanan (Stop Audio)
+        Serial.println("[RESET] Driver Deactivated -> Sinyal Reset Terkirim");
+      }
+    }
 
     bleGamepad.sendReport();
   }
 
-  delay(8); // Responsif 125Hz, sama persis dengan Joy-Con Kanan
+  delay(8);
 }
