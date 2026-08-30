@@ -1,7 +1,7 @@
 /*
   ============================================================
    JOY-CON KIRI (LEFT) - ESP32-C3 Supermini
-   Fitur: BLE Gamepad + ESP-NOW Transmitter/Receiver + HC-SR04 Kiri + Macro Mode
+   Fitur: BLE Gamepad + ESP-NOW + TTP223 (Double Tap) + HC-SR04 Kiri + Macro Mode Permanen
   ============================================================
 */
 
@@ -14,7 +14,7 @@ const int PIN_VRX    = 0;   // GPIO0
 const int PIN_VRY    = 1;   // GPIO1
 const int PIN_SW     = 2;   // GPIO2 (klik stick)
 
-const int PIN_BTN_ACTIVATE = 3;  // GPIO3 -> Tombol Aktivasi Driver
+const int PIN_TTP223 = 3;   // GPIO3 -> Sensor Sentuh TTP223 (Substitusi PIN_BTN_ACTIVATE)
 
 const int PIN_BTN_A    = 4;   // GPIO4 -> Tombol A
 const int PIN_BTN_Y    = 5;   // GPIO5 -> Tombol Y
@@ -50,6 +50,13 @@ bool isDriverActivated = false;
 bool leftSensorTriggered = false;
 bool isMacroActive = false; // Flag Mode Makro aktif setelah Complete
 
+// ---------- VARIABLE DETEKSI DOUBLE TAP TTP223 ----------
+bool lastTouchState = LOW;
+unsigned long lastTapTime = 0;
+const unsigned long DOUBLE_TAP_TIMEOUT = 400; // Maksimal jeda 400ms untuk double tap
+unsigned long activateStartTime = 0;
+const unsigned long HCSR_WINDOW_MS = 7000;   // Window 7 detik untuk HC-SR04
+
 BleGamepad bleGamepad("JoyCon Kiri v2", "DIY", 100);
 
 // Callback Pengiriman Data
@@ -64,9 +71,12 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
   
   if (recvState.currentState == 4) {
     isMacroActive = true;
-    Serial.println("[KIRI] Sinyal Complete (State 4) Diterima -> Mode Makro AKTIF!");
+    isDriverActivated = false; // Proses aktivasi awal selesai, berpindah ke Mode Makro Permanen
+    Serial.println("[KIRI] Sinyal Complete (State 4) Diterima -> Mode Makro PERMANEN AKTIF!");
   } else if (recvState.currentState == 0) {
     isMacroActive = false;
+    isDriverActivated = false;
+    leftSensorTriggered = false;
     Serial.println("[KIRI] Reset State Diterima -> Normal Mode");
   }
 }
@@ -79,7 +89,6 @@ long measureDistance() {
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
 
-  // Timeout diperkecil ke 6000us (~1 meter) agar joystick tidak lag jika tidak ada objek
   long duration = pulseIn(PIN_ECHO, HIGH, 6000); 
   if (duration == 0) return -1;
   return (duration * 0.0343 / 2);
@@ -116,24 +125,31 @@ int8_t processAxis(int raw, int center, float &emaState) {
 
 void sendStateToRight(int state) {
   stateData.currentState = state;
-  // Kirim 2x berturut-turut untuk memastikan paket diterima Bluetooth
   esp_now_send(broadcastAddress, (uint8_t *) &stateData, sizeof(stateData));
   delay(5);
   esp_now_send(broadcastAddress, (uint8_t *) &stateData, sizeof(stateData));
+}
+
+void resetSystem() {
+  isDriverActivated = false;
+  leftSensorTriggered = false;
+  isMacroActive = false;
+  sendStateToRight(0); // Sinyal Reset ke Kanan (Stop Audio)
+  Serial.println("[RESET] System Reset -> Normal Mode Kembali");
 }
 
 // ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
 
-  pinMode(PIN_SW,           INPUT_PULLUP);
-  pinMode(PIN_BTN_ACTIVATE, INPUT_PULLUP);
-  pinMode(PIN_BTN_A,        INPUT_PULLUP);
-  pinMode(PIN_BTN_Y,        INPUT_PULLUP);
-  pinMode(PIN_BTN_UP,       INPUT_PULLUP);
-  pinMode(PIN_BTN_DOWN,     INPUT_PULLUP);
-  pinMode(PIN_BTN_LB,       INPUT_PULLUP);
-  pinMode(PIN_BTN_LT,       INPUT_PULLUP);
+  pinMode(PIN_SW,       INPUT_PULLUP);
+  pinMode(PIN_TTP223, INPUT_PULLDOWN); // TTP223 mengeluarkan sinyal HIGH saat disentuh
+  pinMode(PIN_BTN_A,    INPUT_PULLUP);
+  pinMode(PIN_BTN_Y,    INPUT_PULLUP);
+  pinMode(PIN_BTN_UP,   INPUT_PULLUP);
+  pinMode(PIN_BTN_DOWN, INPUT_PULLUP);
+  pinMode(PIN_BTN_LB,   INPUT_PULLUP);
+  pinMode(PIN_BTN_LT,   INPUT_PULLUP);
 
   pinMode(PIN_TRIG, OUTPUT);
   pinMode(PIN_ECHO, INPUT);
@@ -185,7 +201,7 @@ void loop() {
       if (digitalRead(PIN_BTN_LB)   == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
       if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
     } else {
-      // --- MODE MAKRO (Setelah Henshin Complete) ---
+      // --- MODE MAKRO PERMANEN (Setelah Henshin Complete) ---
       if (digitalRead(PIN_BTN_A) == LOW) {
         bleGamepad.press(BUTTON_2);
         bleGamepad.press(BUTTON_6);
@@ -202,19 +218,44 @@ void loop() {
       if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
     }
 
-    // 3. LOGIKA AKTIVASI & ULTRASONIK KIRI
-    bool btnActivateState = (digitalRead(PIN_BTN_ACTIVATE) == LOW);
-    if (btnActivateState) {
-      bleGamepad.press(BUTTON_8);
+    // 3. LOGIKA DOUBLE TAP TTP223
+    bool currentTouchState = (digitalRead(PIN_TTP223) == HIGH);
+    
+    // Deteksi RISING EDGE (disentuh)
+    if (currentTouchState == HIGH && lastTouchState == LOW) {
+      unsigned long now = millis();
       
-      if (!isDriverActivated) {
-        isDriverActivated = true;
-        leftSensorTriggered = false;
-        sendStateToRight(1); // Perintah Kanan: Putar 0001.mp3
-        Serial.println("[STATE 1] Driver Active -> Sinyal 0001.mp3 terkirim ke Kanan");
+      if (now - lastTapTime <= DOUBLE_TAP_TIMEOUT) {
+        // DOUBLE TAP TERDETEKSI!
+        if (isMacroActive || isDriverActivated) {
+          // Jika sedang aktif/Henshin, double tap akan MENGEMBALIKAN KE MODE NORMAL
+          resetSystem();
+        } else {
+          // Jika belum aktif, double tap akan MEMULAI HENSHIN
+          isDriverActivated = true;
+          leftSensorTriggered = false;
+          activateStartTime = now; // Catat waktu mulai window 7 detik
+          bleGamepad.press(BUTTON_8);
+          sendStateToRight(1);     // Perintah Kanan: Putar 0001.mp3
+          Serial.println("[DOUBLE TAP] Driver Active -> Sinyal 0001.mp3 terkirim ke Kanan");
+        }
+        lastTapTime = 0; // Reset timer tap
+      } else {
+        lastTapTime = now; // Single tap pertama
       }
+      delay(50); // Debounce sederhana
+    }
+    lastTouchState = currentTouchState;
 
-      if (isDriverActivated && !leftSensorTriggered) {
+    // 4. LOGIKA TIMEOUT 7 DETIK HC-SR04 KIRI
+    if (isDriverActivated && !leftSensorTriggered) {
+      // Cek apakah window 7 detik sudah habis
+      if (millis() - activateStartTime > HCSR_WINDOW_MS) {
+        Serial.println("[TIMEOUT 7s] Tidak ada pemicu HC-SR04 -> Reset System");
+        bleGamepad.release(BUTTON_8);
+        resetSystem();
+      } else {
+        // Proses pengecekan ultrasonik selama dalam window 7 detik
         static unsigned long lastUltrasoundTime = 0;
         if (millis() - lastUltrasoundTime > 60) {
           lastUltrasoundTime = millis();
@@ -227,18 +268,11 @@ void loop() {
           }
         }
       }
+    }
 
-    } else {
+    // Lepas pemicu BUTTON_8 jika window aktivasi telah selesai
+    if (!isDriverActivated && !isMacroActive) {
       bleGamepad.release(BUTTON_8);
-      
-      // Jika tombol aktivasi dilepas KAPAN PUN (Selalu Reset)
-      if (isDriverActivated || isMacroActive) {
-        isDriverActivated = false;
-        leftSensorTriggered = false;
-        isMacroActive = false; // Kembalikan ke mode normal
-        sendStateToRight(0);   // Sinyal Reset ke Kanan (Stop Audio)
-        Serial.println("[RESET] Driver Deactivated -> Sinyal Reset Terkirim & Mode Normal Kembali");
-      }
     }
 
     bleGamepad.sendReport();
