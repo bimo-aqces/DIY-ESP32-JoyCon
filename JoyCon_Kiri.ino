@@ -1,7 +1,8 @@
 /*
   ============================================================
    JOY-CON KIRI (LEFT) - ESP32-C3 Supermini
-   Fitur: BLE Gamepad + ESP-NOW + TTP223 (Double Tap) + HC-SR04 Kiri + Macro Mode Permanen
+   Fitur: BLE Gamepad + ESP-NOW + TTP223 (Double Tap + 30ms Stability Filter) 
+          + HC-SR04 Kiri (7s Window) + Macro Mode Permanen
   ============================================================
 */
 
@@ -51,7 +52,7 @@ bool leftSensorTriggered = false;
 bool isMacroActive = false; // Flag Mode Makro aktif setelah Complete
 
 // ---------- VARIABLE DETEKSI DOUBLE TAP TTP223 ----------
-bool lastTouchState = LOW;
+bool lastTouchState = false;
 unsigned long lastTapTime = 0;
 const unsigned long DOUBLE_TAP_TIMEOUT = 400; // Maksimal jeda 400ms untuk double tap
 unsigned long activateStartTime = 0;
@@ -143,7 +144,7 @@ void setup() {
   Serial.begin(115200);
 
   pinMode(PIN_SW,       INPUT_PULLUP);
-  pinMode(PIN_TTP223, INPUT_PULLDOWN); // TTP223 mengeluarkan sinyal HIGH saat disentuh
+  pinMode(PIN_TTP223,   INPUT_PULLDOWN); // Menarik sinyal mengambang ke GND
   pinMode(PIN_BTN_A,    INPUT_PULLUP);
   pinMode(PIN_BTN_Y,    INPUT_PULLUP);
   pinMode(PIN_BTN_UP,   INPUT_PULLUP);
@@ -218,44 +219,60 @@ void loop() {
       if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
     }
 
-    // 3. LOGIKA DOUBLE TAP TTP223
-    bool currentTouchState = (digitalRead(PIN_TTP223) == HIGH);
-    
-    // Deteksi RISING EDGE (disentuh)
-    if (currentTouchState == HIGH && lastTouchState == LOW) {
+    // 3. LOGIKA DETEKSI TTP223 + FILTER STABILITY (30ms Debounce)
+    const unsigned long TOUCH_STABLE_MS = 30; // Harus stabil HIGH min 30ms
+    static unsigned long touchStartTime = 0;
+    static bool touchPending = false;
+    static bool verifiedTouchState = false;
+
+    bool rawTouch = (digitalRead(PIN_TTP223) == HIGH);
+
+    // Filter Stability Check
+    if (rawTouch) {
+      if (!touchPending) {
+        touchPending = true;
+        touchStartTime = millis();
+      } else if (millis() - touchStartTime >= TOUCH_STABLE_MS) {
+        verifiedTouchState = true; // Sinyal terverifikasi asli disentuh
+      }
+    } else {
+      touchPending = false;
+      verifiedTouchState = false;
+    }
+
+    // Logika Deteksi RISING EDGE & DOUBLE TAP dari sinyal terverifikasi
+    if (verifiedTouchState == true && lastTouchState == false) {
       unsigned long now = millis();
       
       if (now - lastTapTime <= DOUBLE_TAP_TIMEOUT) {
         // DOUBLE TAP TERDETEKSI!
         if (isMacroActive || isDriverActivated) {
-          // Jika sedang aktif/Henshin, double tap akan MENGEMBALIKAN KE MODE NORMAL
+          // Jika sedang aktif/Henshin -> RESET KE MODE NORMAL
           resetSystem();
         } else {
-          // Jika belum aktif, double tap akan MEMULAI HENSHIN
+          // Jika belum aktif -> MULAI HENSHIN
           isDriverActivated = true;
           leftSensorTriggered = false;
           activateStartTime = now; // Catat waktu mulai window 7 detik
           bleGamepad.press(BUTTON_8);
           sendStateToRight(1);     // Perintah Kanan: Putar 0001.mp3
-          Serial.println("[DOUBLE TAP] Driver Active -> Sinyal 0001.mp3 terkirim ke Kanan");
+          Serial.println("[DOUBLE TAP VALID] Driver Active -> Play 0001.mp3");
         }
         lastTapTime = 0; // Reset timer tap
       } else {
-        lastTapTime = now; // Single tap pertama
+        lastTapTime = now; // Single tap pertama terverifikasi
       }
-      delay(50); // Debounce sederhana
+      delay(20);
     }
-    lastTouchState = currentTouchState;
+    lastTouchState = verifiedTouchState;
 
     // 4. LOGIKA TIMEOUT 7 DETIK HC-SR04 KIRI
     if (isDriverActivated && !leftSensorTriggered) {
-      // Cek apakah window 7 detik sudah habis
       if (millis() - activateStartTime > HCSR_WINDOW_MS) {
         Serial.println("[TIMEOUT 7s] Tidak ada pemicu HC-SR04 -> Reset System");
         bleGamepad.release(BUTTON_8);
         resetSystem();
       } else {
-        // Proses pengecekan ultrasonik selama dalam window 7 detik
         static unsigned long lastUltrasoundTime = 0;
         if (millis() - lastUltrasoundTime > 60) {
           lastUltrasoundTime = millis();
