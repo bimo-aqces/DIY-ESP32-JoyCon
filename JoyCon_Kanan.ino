@@ -1,43 +1,26 @@
 /*
   ============================================================
    JOY-CON KANAN (RIGHT) - ESP32-C3 Supermini
-   BLE Gamepad Controller (mirip Nintendo Joy-Con)
+   Fitur: BLE Gamepad + ESP-NOW + DFPlayer Mini (Root MP3) + HC-SR04 + Macro
   ============================================================
-  Library dibutuhkan (install lewat Library Manager):
-    - "ESP32 BLE Gamepad" by lemmingDev
-      (akan otomatis butuh NimBLE-Arduino, ikuti prompt install)
-
-  WIRING:
-    Analog Stick Module:
-      VRx -> GPIO0  (ADC1_CH0)
-      VRy -> GPIO1  (ADC1_CH1)
-      SW  -> GPIO2  (klik stick, tekan ke bawah)
-      VCC -> 3V3
-      GND -> GND
-
-    Tombol digital (contoh: A, B, X, Y, Plus, Home):
-      BTN_A     -> GPIO4
-      BTN_B     -> GPIO5
-      BTN_X     -> GPIO6
-      BTN_Y     -> GPIO7
-      BTN_PLUS  -> GPIO8
-      BTN_HOME  -> GPIO10
-    Semua tombol: kaki lain ke GND, mode INPUT_PULLUP (aktif LOW)
-
-  CATATAN ANTI-JITTER: sama seperti Joy-Con Kiri
-    1. Oversampling ADC
-    2. EMA (exponential moving average) filter
-    3. Deadzone radial di titik tengah
-    4. Auto-calibrate titik tengah saat boot (jangan sentuh stick saat nyala)
+   Struktur SD Card (Wajib di Root SD Card):
+     SD:/0001.mp3  -> Audio Standby / Driver Aktif
+     SD:/0002.mp3  -> Audio Sensor Kiri Terpemicu
+     SD:/0003.mp3  -> Audio Sensor Kanan Terpemicu
+     SD:/0004.mp3  -> Audio Henshin Complete (Masuk Mode Makro)
   ============================================================
 */
 
 #include <BleGamepad.h>
+#include <esp_now.h>
+#include <WiFi.h>
+#include <HardwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
 
-// ---------- KONFIGURASI PIN ----------
-const int PIN_VRX   = 0;   // GPIO0
-const int PIN_VRY   = 1;   // GPIO1
-const int PIN_SW    = 2;   // GPIO2 (klik stick)
+// ---------- KONFIGURASI PIN GAMEPAD ----------
+const int PIN_VRX       = 0;   // GPIO0
+const int PIN_VRY       = 1;   // GPIO1
+const int PIN_SW        = 2;   // GPIO2 (klik stick)
 
 const int PIN_BTN_B     = 4;   // GPIO4 -> Tombol B
 const int PIN_BTN_X     = 5;   // GPIO5 -> Tombol X
@@ -46,17 +29,96 @@ const int PIN_BTN_LEFT  = 7;   // GPIO7 -> D-Pad Kiri
 const int PIN_BTN_RB    = 8;   // GPIO8 -> RB (R1)
 const int PIN_BTN_RT    = 9;   // GPIO9 -> RT (R2)
 
+// ---------- PIN SENSOR ULTRASONIK (HC-SR04 KANAN) ----------
+const int PIN_TRIG_RIGHT = 10; // GPIO10
+const int PIN_ECHO_RIGHT = 3;  // GPIO3
+const int TRIGGER_DISTANCE_CM = 15; // Jarak pemicu (15cm)
+
+// ---------- PIN DFPLAYER MINI (SUDAH DIPERBAIKI Sesuai Tes) ----------
+const int PIN_DFP_RX = 20; // RX ESP32 (Pin 20) <- Terhubung ke TX DFPlayer
+const int PIN_DFP_TX = 21; // TX ESP32 (Pin 21) -> Terhubung ke RX DFPlayer (lewat Resistor 1k)
+
+// ---------- ALAMAT MAC ESP32 KIRI ----------
+uint8_t leftMacAddress[] = {0xE8, 0x3D, 0xC1, 0x9D, 0x54, 0xD8};
+
+// ---------- STRUKTUR DATA ESP-NOW ----------
+struct SystemState {
+  int currentState; // 0: Reset, 1: Standby, 2: Left Trigger, 3: Right Trigger, 4: Complete
+};
+SystemState stateData;
+
+// ---------- OBJECT & PERIPHERAL ----------
+HardwareSerial dfpSerial(1);
+DFRobotDFPlayerMini myDFPlayer;
+BleGamepad bleGamepad("JoyCon Kanan v2", "DIY", 100);
+
 // ---------- KONFIGURASI FILTER ANALOG ----------
 const int   OVERSAMPLE_COUNT   = 8;
 const float EMA_ALPHA          = 0.15f;
 const int   DEADZONE_RADIUS    = 6;
 const int   ADC_MAX            = 4095;
 
-// ---------- STATE ----------
+// ---------- STATE SYSTEM ----------
 float emaX = 0, emaY = 0;
 int centerX = 2048, centerY = 2048;
 
-BleGamepad bleGamepad("JoyCon Kanan v2", "DIY", 100);
+int currentState = 0;
+bool isMacroActive = false;
+
+// Variable untuk Delay Non-Blocking State 3 ke 4
+unsigned long state3StartTime = 0;
+bool waitingForComplete = false;
+
+// ---------- ESP-NOW CALLBACKS ----------
+void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // Callback status pengiriman
+}
+
+void sendStateToLeft(int state) {
+  stateData.currentState = state;
+  esp_now_send(leftMacAddress, (uint8_t *) &stateData, sizeof(stateData));
+}
+
+void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
+  SystemState recvState;
+  memcpy(&recvState, incomingData, sizeof(recvState));
+  
+  currentState = recvState.currentState;
+
+  if (currentState == 1) {
+    // Sinyal Driver Aktif dari Kiri -> Putar 0001.mp3
+    myDFPlayer.play(1); 
+    isMacroActive = false;
+    waitingForComplete = false;
+    Serial.println("[RIGHT] State 1 -> Play 0001.mp3");
+  } 
+  else if (currentState == 2) {
+    // Sinyal Sensor Kiri Terpemicu -> Putar 0002.mp3
+    myDFPlayer.play(2);
+    waitingForComplete = false;
+    Serial.println("[RIGHT] State 2 -> Play 0002.mp3 (Sensor Kanan Ready)");
+  } 
+  else if (currentState == 0) {
+    // Tombol Aktivasi dilepas -> Stop Audio & Reset State
+    myDFPlayer.stop();
+    isMacroActive = false;
+    waitingForComplete = false;
+    Serial.println("[RIGHT] Reset State -> Stop Audio & Normal Mode");
+  }
+}
+
+// ---------- FUNGSI ANALOG & ULTRASONIK ----------
+long measureDistanceRight() {
+  digitalWrite(PIN_TRIG_RIGHT, LOW);
+  delayMicroseconds(2);
+  digitalWrite(PIN_TRIG_RIGHT, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(PIN_TRIG_RIGHT, LOW);
+
+  long duration = pulseIn(PIN_ECHO_RIGHT, HIGH, 20000); 
+  if (duration == 0) return -1;
+  return (duration * 0.0343 / 2);
+}
 
 int readAveraged(int pin) {
   long sum = 0;
@@ -69,38 +131,38 @@ int readAveraged(int pin) {
 
 void calibrateCenter() {
   long sumX = 0, sumY = 0;
-  const int samples = 50;
-  for (int i = 0; i < samples; i++) {
+  for (int i = 0; i < 50; i++) {
     sumX += readAveraged(PIN_VRX);
     sumY += readAveraged(PIN_VRY);
     delay(5);
   }
-  centerX = sumX / samples;
-  centerY = sumY / samples;
+  centerX = sumX / 50;
+  centerY = sumY / 50;
 }
 
 int8_t processAxis(int raw, int center, float &emaState) {
   emaState = (EMA_ALPHA * raw) + ((1.0f - EMA_ALPHA) * emaState);
-
   float diff = emaState - center;
-  float scaled;
-  if (diff >= 0) {
-    scaled = (diff / (ADC_MAX - center)) * 127.0f;
-  } else {
-    scaled = (diff / center) * 127.0f;
-  }
-
-  int val = (int)scaled;
-  val = constrain(val, -127, 127);
-
+  float scaled = (diff >= 0) ? (diff / (ADC_MAX - center)) * 127.0f : (diff / center) * 127.0f;
+  int val = constrain((int)scaled, -127, 127);
   if (abs(val) < DEADZONE_RADIUS) val = 0;
-
   return (int8_t)val;
 }
 
+// ---------- SETUP ----------
 void setup() {
   Serial.begin(115200);
 
+  // Inisialisasi Hardware Serial untuk DFPlayer
+  dfpSerial.begin(9600, SERIAL_8N1, PIN_DFP_RX, PIN_DFP_TX);
+  if (myDFPlayer.begin(dfpSerial)) {
+    myDFPlayer.volume(15); // Volume (0 - 30)
+    Serial.println("DFPlayer Mini Terhubung.");
+  } else {
+    Serial.println("DFPlayer Mini Gagal Ditemukan!");
+  }
+
+  // Pin Tombol
   pinMode(PIN_SW,        INPUT_PULLUP);
   pinMode(PIN_BTN_B,     INPUT_PULLUP);
   pinMode(PIN_BTN_X,     INPUT_PULLUP);
@@ -109,14 +171,29 @@ void setup() {
   pinMode(PIN_BTN_RB,    INPUT_PULLUP);
   pinMode(PIN_BTN_RT,    INPUT_PULLUP);
 
-  analogReadResolution(12);
+  // Pin Sensor Ultrasonik
+  pinMode(PIN_TRIG_RIGHT, OUTPUT);
+  pinMode(PIN_ECHO_RIGHT, INPUT);
+  digitalWrite(PIN_TRIG_RIGHT, LOW);
 
-  Serial.println("Kalibrasi stick... jangan sentuh joystick!");
+  // ESP-NOW Setup
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_send_cb(OnDataSent);
+    esp_now_register_recv_cb(OnDataRecv);
+
+    esp_now_peer_info_t peerInfo = {};
+    memcpy(peerInfo.peer_addr, leftMacAddress, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    esp_now_add_peer(&peerInfo);
+  }
+
+  analogReadResolution(12);
   delay(800);
   calibrateCenter();
   emaX = centerX;
   emaY = centerY;
-  Serial.printf("Kalibrasi selesai. CenterX=%d CenterY=%d\n", centerX, centerY);
 
   BleGamepadConfiguration cfg;
   cfg.setAutoReport(false);
@@ -127,7 +204,40 @@ void setup() {
   bleGamepad.begin(&cfg);
 }
 
+// ---------- LOOP ----------
 void loop() {
+  // 1. Cek Sensor Ultrasonik Kanan (Hanya aktif jika State 2 telah tercapai)
+  if (currentState == 2) {
+    static unsigned long lastCheckTime = 0;
+    if (millis() - lastCheckTime > 60) {
+      lastCheckTime = millis();
+      long dist = measureDistanceRight();
+
+      if (dist > 0 && dist <= TRIGGER_DISTANCE_CM) {
+        currentState = 3;
+        state3StartTime = millis();
+        waitingForComplete = true;
+        
+        Serial.printf("[RIGHT] Sensor Kanan Trigger (%ld cm) -> Play 0003.mp3\n", dist);
+        myDFPlayer.play(3); // Putar 0003.mp3
+      }
+    }
+  }
+
+  // 1b. Transisi Otomatis State 3 -> State 4 (Menggunakan Millis tanpa Mengunci Loop)
+  if (waitingForComplete && (millis() - state3StartTime >= 1200)) {
+    waitingForComplete = false;
+    currentState = 4;
+    isMacroActive = true;
+    
+    myDFPlayer.play(4); // Putar 0004.mp3 (Henshin Complete)
+    Serial.println("[RIGHT] Henshin Complete! -> Play 0004.mp3 & Aktifkan Mode Makro");
+
+    // Kirim sinyal State 4 ke Joy-Con Kiri
+    sendStateToLeft(4);
+  }
+
+  // 2. Baca Input BLE Gamepad
   if (bleGamepad.isConnected()) {
     int rawX = readAveraged(PIN_VRX);
     int rawY = readAveraged(PIN_VRY);
@@ -137,13 +247,32 @@ void loop() {
 
     bleGamepad.setAxes(gx, gy, 0, 0, 0, 0, 0, 0);
 
-    if (digitalRead(PIN_SW)        == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1); // Click Stick (R3)
-    if (digitalRead(PIN_BTN_B)     == LOW) bleGamepad.press(BUTTON_2); else bleGamepad.release(BUTTON_2); // Tombol B
-    if (digitalRead(PIN_BTN_X)     == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3); // Tombol X
-    if (digitalRead(PIN_BTN_RIGHT) == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4); // D-Pad Kanan
-    if (digitalRead(PIN_BTN_LEFT)  == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5); // D-Pad Kiri
-    if (digitalRead(PIN_BTN_RB)    == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6); // RB (R1)
-    if (digitalRead(PIN_BTN_RT)    == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7); // RT (R2)
+    if (!isMacroActive) {
+      // --- MODE NORMAL ---
+      if (digitalRead(PIN_SW)        == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1);
+      if (digitalRead(PIN_BTN_B)     == LOW) bleGamepad.press(BUTTON_2); else bleGamepad.release(BUTTON_2);
+      if (digitalRead(PIN_BTN_X)     == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3);
+      if (digitalRead(PIN_BTN_RIGHT) == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4);
+      if (digitalRead(PIN_BTN_LEFT)  == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5);
+      if (digitalRead(PIN_BTN_RB)    == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
+      if (digitalRead(PIN_BTN_RT)    == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
+    } else {
+      // --- MODE MAKRO (Setelah Henshin Complete) ---
+      if (digitalRead(PIN_BTN_B) == LOW) {
+        bleGamepad.press(BUTTON_2);
+        bleGamepad.press(BUTTON_7);
+      } else {
+        bleGamepad.release(BUTTON_2);
+        bleGamepad.release(BUTTON_7);
+      }
+
+      if (digitalRead(PIN_SW)        == LOW) bleGamepad.press(BUTTON_1); else bleGamepad.release(BUTTON_1);
+      if (digitalRead(PIN_BTN_X)     == LOW) bleGamepad.press(BUTTON_3); else bleGamepad.release(BUTTON_3);
+      if (digitalRead(PIN_BTN_RIGHT) == LOW) bleGamepad.press(BUTTON_4); else bleGamepad.release(BUTTON_4);
+      if (digitalRead(PIN_BTN_LEFT)  == LOW) bleGamepad.press(BUTTON_5); else bleGamepad.release(BUTTON_5);
+      if (digitalRead(PIN_BTN_RB)    == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
+      if (digitalRead(PIN_BTN_RT)    == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
+    }
 
     bleGamepad.sendReport();
   }
