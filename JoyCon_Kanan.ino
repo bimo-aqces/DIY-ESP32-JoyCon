@@ -1,7 +1,7 @@
 /*
   ============================================================
    JOY-CON KANAN (RIGHT) - ESP32-C3 Supermini
-   Fitur: BLE Gamepad + ESP-NOW + DFPlayer Mini (Root MP3) + HC-SR04 + Macro
+   Fitur: BLE Gamepad + ESP-NOW + DFPlayer Mini + HC-SR04 + Macro Permanen
   ============================================================
    Struktur SD Card (Wajib di Root SD Card):
      SD:/0001.mp3  -> Audio Standby / Driver Aktif
@@ -34,7 +34,7 @@ const int PIN_TRIG_RIGHT = 10; // GPIO10
 const int PIN_ECHO_RIGHT = 3;  // GPIO3
 const int TRIGGER_DISTANCE_CM = 15; // Jarak pemicu (15cm)
 
-// ---------- PIN DFPLAYER MINI (SUDAH DIPERBAIKI Sesuai Tes) ----------
+// ---------- PIN DFPLAYER MINI ----------
 const int PIN_DFP_RX = 20; // RX ESP32 (Pin 20) <- Terhubung ke TX DFPlayer
 const int PIN_DFP_TX = 21; // TX ESP32 (Pin 21) -> Terhubung ke RX DFPlayer (lewat Resistor 1k)
 
@@ -65,9 +65,11 @@ int centerX = 2048, centerY = 2048;
 int currentState = 0;
 bool isMacroActive = false;
 
-// Variable untuk Delay Non-Blocking State 3 ke 4
+// Variable untuk Delay Non-Blocking State 3 ke 4 & Timeout 7 detik
 unsigned long state3StartTime = 0;
 bool waitingForComplete = false;
+unsigned long state2StartTime = 0; // Timer window 7 detik sensor Kanan
+const unsigned long RIGHT_HCSR_WINDOW_MS = 7000;
 
 // ---------- ESP-NOW CALLBACKS ----------
 void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
@@ -96,13 +98,14 @@ void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incoming
     Serial.println("[RIGHT] State 1 -> Play 0001.mp3");
   } 
   else if (currentState == 2) {
-    // Sinyal Sensor Kiri Terpemicu -> Putar 0002.mp3
+    // Sinyal Sensor Kiri Terpemicu -> Putar 0002.mp3 & Mulai Timer 7s Kanan
     myDFPlayer.play(2);
+    state2StartTime = millis(); // Catat waktu sensor Kanan mulai aktif
     waitingForComplete = false;
-    Serial.println("[RIGHT] State 2 -> Play 0002.mp3 (Sensor Kanan Ready)");
+    Serial.println("[RIGHT] State 2 -> Play 0002.mp3 (Sensor Kanan Ready 7s)");
   } 
   else if (currentState == 0) {
-    // Tombol Aktivasi dilepas -> Stop Audio & Reset State
+    // Reset State -> Stop Audio & Kembali ke Normal Mode
     myDFPlayer.stop();
     isMacroActive = false;
     waitingForComplete = false;
@@ -118,7 +121,7 @@ long measureDistanceRight() {
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG_RIGHT, LOW);
 
-  long duration = pulseIn(PIN_ECHO_RIGHT, HIGH, 20000); 
+  long duration = pulseIn(PIN_ECHO_RIGHT, HIGH, 6000); 
   if (duration == 0) return -1;
   return (duration * 0.0343 / 2);
 }
@@ -209,32 +212,40 @@ void setup() {
 
 // ---------- LOOP ----------
 void loop() {
-  // 1. Cek Sensor Ultrasonik Kanan (Hanya aktif jika State 2 telah tercapai)
+  // 1. Cek Sensor Ultrasonik Kanan (Hanya aktif jika State 2 tercapai)
   if (currentState == 2) {
-    static unsigned long lastCheckTime = 0;
-    if (millis() - lastCheckTime > 60) {
-      lastCheckTime = millis();
-      long dist = measureDistanceRight();
+    // Pengecekan Timeout 7 detik sensor Kanan
+    if (millis() - state2StartTime > RIGHT_HCSR_WINDOW_MS) {
+      Serial.println("[RIGHT TIMEOUT 7s] Tidak ada trigger Kanan -> Kirim Reset ke Kiri");
+      currentState = 0;
+      myDFPlayer.stop();
+      sendStateToLeft(0); // Sinyal reset balik ke Kiri
+    } else {
+      static unsigned long lastCheckTime = 0;
+      if (millis() - lastCheckTime > 60) {
+        lastCheckTime = millis();
+        long dist = measureDistanceRight();
 
-      if (dist > 0 && dist <= TRIGGER_DISTANCE_CM) {
-        currentState = 3;
-        state3StartTime = millis();
-        waitingForComplete = true;
-        
-        Serial.printf("[RIGHT] Sensor Kanan Trigger (%ld cm) -> Play 0003.mp3\n", dist);
-        myDFPlayer.play(3); // Putar 0003.mp3
+        if (dist > 0 && dist <= TRIGGER_DISTANCE_CM) {
+          currentState = 3;
+          state3StartTime = millis();
+          waitingForComplete = true;
+          
+          Serial.printf("[RIGHT] Sensor Kanan Trigger (%ld cm) -> Play 0003.mp3\n", dist);
+          myDFPlayer.play(3); // Putar 0003.mp3
+        }
       }
     }
   }
 
-  // 1b. Transisi Otomatis State 3 -> State 4 (Menggunakan Millis tanpa Mengunci Loop)
+  // 1b. Transisi Otomatis State 3 -> State 4 (Henshin Complete)
   if (waitingForComplete && (millis() - state3StartTime >= 1200)) {
     waitingForComplete = false;
     currentState = 4;
-    isMacroActive = true;
+    isMacroActive = true; // Kunci Mode Makro secara Permanen
     
     myDFPlayer.play(4); // Putar 0004.mp3 (Henshin Complete)
-    Serial.println("[RIGHT] Henshin Complete! -> Play 0004.mp3 & Aktifkan Mode Makro");
+    Serial.println("[RIGHT] Henshin Complete! -> Play 0004.mp3 & Aktifkan Mode Makro PERMANEN");
 
     // Kirim sinyal State 4 ke Joy-Con Kiri
     sendStateToLeft(4);
@@ -260,7 +271,7 @@ void loop() {
       if (digitalRead(PIN_BTN_RB)    == LOW) bleGamepad.press(BUTTON_6); else bleGamepad.release(BUTTON_6);
       if (digitalRead(PIN_BTN_RT)    == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
     } else {
-      // --- MODE MAKRO (Setelah Henshin Complete) ---
+      // --- MODE MAKRO PERMANEN (Setelah Henshin Complete) ---
       if (digitalRead(PIN_BTN_B) == LOW) {
         bleGamepad.press(BUTTON_2);
         bleGamepad.press(BUTTON_7);
