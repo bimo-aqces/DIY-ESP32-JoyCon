@@ -76,6 +76,9 @@ void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
 
 void sendStateToLeft(int state) {
   stateData.currentState = state;
+  // Kirim 2x berturut-turut dengan jeda 5ms untuk menembus bentrokan traffic BLE
+  esp_now_send(leftMacAddress, (uint8_t *) &stateData, sizeof(stateData));
+  delay(5);
   esp_now_send(leftMacAddress, (uint8_t *) &stateData, sizeof(stateData));
 }
 
