@@ -52,12 +52,12 @@ bool isMacroActive = false; // Flag Mode Makro aktif setelah Complete
 
 BleGamepad bleGamepad("JoyCon Kiri v2", "DIY", 100);
 
-// Callback Pengiriman Data (Kompatibel ESP32 v3.x)
+// Callback Pengiriman Data
 void OnDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  // Callback pengiriman
+  // Callback status pengiriman
 }
 
-// Callback Penerimaan Data (Menerima sinyal State 4 Complete dari Joy-Con Kanan)
+// Callback Penerimaan Data (Menerima sinyal State 4 / State 0 dari Joy-Con Kanan)
 void OnDataRecv(const esp_now_recv_info_t *esp_now_info, const uint8_t *incomingData, int len) {
   SystemState recvState;
   memcpy(&recvState, incomingData, sizeof(recvState));
@@ -79,7 +79,8 @@ long measureDistance() {
   delayMicroseconds(10);
   digitalWrite(PIN_TRIG, LOW);
 
-  long duration = pulseIn(PIN_ECHO, HIGH, 20000); 
+  // Timeout diperkecil ke 6000us (~1 meter) agar joystick tidak lag jika tidak ada objek
+  long duration = pulseIn(PIN_ECHO, HIGH, 6000); 
   if (duration == 0) return -1;
   return (duration * 0.0343 / 2);
 }
@@ -115,6 +116,9 @@ int8_t processAxis(int raw, int center, float &emaState) {
 
 void sendStateToRight(int state) {
   stateData.currentState = state;
+  // Kirim 2x berturut-turut untuk memastikan paket diterima Bluetooth
+  esp_now_send(broadcastAddress, (uint8_t *) &stateData, sizeof(stateData));
+  delay(5);
   esp_now_send(broadcastAddress, (uint8_t *) &stateData, sizeof(stateData));
 }
 
@@ -182,7 +186,6 @@ void loop() {
       if (digitalRead(PIN_BTN_LT)   == LOW) bleGamepad.press(BUTTON_7); else bleGamepad.release(BUTTON_7);
     } else {
       // --- MODE MAKRO (Setelah Henshin Complete) ---
-      // Contoh: Tombol A menekan Button 2 + Button 6 sekaligus
       if (digitalRead(PIN_BTN_A) == LOW) {
         bleGamepad.press(BUTTON_2);
         bleGamepad.press(BUTTON_6);
@@ -228,12 +231,13 @@ void loop() {
     } else {
       bleGamepad.release(BUTTON_8);
       
-      // Jika tombol aktivasi dilepas SEBELEUM Henshin Selesai (bukan dalam Mode Makro)
-      if (isDriverActivated && !isMacroActive) {
+      // Jika tombol aktivasi dilepas KAPAN PUN (Selalu Reset)
+      if (isDriverActivated || isMacroActive) {
         isDriverActivated = false;
         leftSensorTriggered = false;
-        sendStateToRight(0); // Sinyal Reset ke Kanan (Stop Audio)
-        Serial.println("[RESET] Driver Deactivated -> Sinyal Reset Terkirim");
+        isMacroActive = false; // Kembalikan ke mode normal
+        sendStateToRight(0);   // Sinyal Reset ke Kanan (Stop Audio)
+        Serial.println("[RESET] Driver Deactivated -> Sinyal Reset Terkirim & Mode Normal Kembali");
       }
     }
 
